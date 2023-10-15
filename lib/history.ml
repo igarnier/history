@@ -1,182 +1,245 @@
-type chunk = string
+module type Action_S =
+sig
+  type t
+  val nil : t
+  val equal : t -> t -> bool
+  val pp : Format.formatter -> t -> unit
+end
 
-type desc =
-  | End
-  | Done of { uid : int ;
-              n_common : int ; (** Number of tokens in common with the preceding context. *)
-              chunk : chunk ;
-              past : chunk list ;
-              mutable next : t }
-  | Redo of { uid : int ;
-              chunk : chunk ;
-              next : t }
+module type State_S =
+sig
+  type t
+  val init : t
+end
 
-and t = desc ref
+module type S =
+sig
+  type action
+  type state
+  type t
+  val create : unit -> t
+  val process_action :
+    ((state * action) list -> state -> action -> state) -> action -> t -> t
 
-let gen =
-  let x = ref 0 in
-  fun () ->
-    let v = !x in
-    incr x;
-    v
+  module Dot :
+    sig
+      val to_dot : t list -> string -> unit
+    end
+end
 
-let chunk_equal (c1 : chunk) (c2 : chunk) =
-  String.equal c1 c2
-
-let rec get_n_common_and_reverse prev_desc_ref desc_ref acc k =
-  match !desc_ref with
-  | Redo _ ->
-    (* Impossible because a [Done] node may only point to a [End] or [Done] node. *)
-    assert false
-  | End ->
-    k () ;
-    acc
-  | Done { uid = _ ; past = _ ; n_common ; next ; chunk } ->
-    let acc = Int.min acc n_common in
-    get_n_common_and_reverse desc_ref next acc (fun () ->
-        k () ;
-        desc_ref := Redo { uid = gen () ; chunk ; next = prev_desc_ref }
-      )
-
-let create () =
-  ref (Done { uid = gen () ; n_common = 0 ; chunk = "" ; past = []; next = ref End })
-
-let rec process_chunk perform_inference ctxt new_chunk base =
-  match !base with
-  | End ->
-    (* Impossible because users are only provided references to [Done] or [Redo]. *)
-    assert false
-  | Done ({ uid = _; n_common; chunk; past; next } as payload) ->
-    (* Invariant: at this point, the chain of nodes reachable from [next] only contains
-       [Done] nodes. *)
-    let n_common = get_n_common_and_reverse base next n_common (fun () -> ()) in
-    (* Invariant: at this point, [next] is rewritten to point to a [Redo] node. *)
-    let n_common = perform_inference ctxt n_common new_chunk in
-    let hist_elt =
-      Done { uid = gen ();
-             n_common;
-             chunk = new_chunk;
-             past = (chunk :: past);
-             next = ref End }
-    in
-    payload.next <- ref hist_elt ;
-    payload.next
-  | Redo _ ->
-    let rec get_root desc_ref acc =
-      match !desc_ref with
-      | End -> assert false
-      | Done { uid = _; chunk = _; past = _; n_common = _; next } ->
-        max_prefix desc_ref next acc
-      | Redo { uid = _; chunk; next } ->
-        get_root next (chunk :: acc)
-    and max_prefix prev_desc_ref desc_ref acc =
-      match !desc_ref, acc with
-      | _, [] ->
-        (* Impossible: [get_root] is called from a [Redo] node. *)
-        assert false
-      | Redo _, _ ->
-        (* Impossible because [Done] nodes cannot point to [Redo] nodes. *)
-        assert false
-      | End, _ -> prev_desc_ref
-      | Done { uid = _; n_common = _; past = _; chunk; next }, chunk' :: acc' ->
-        if chunk_equal chunk chunk' then
-          max_prefix desc_ref next acc'
-        else
-          (
-            List.fold_left (fun base chunk_to_redo ->
-                process_chunk perform_inference ctxt chunk_to_redo base
-              ) prev_desc_ref acc
-          )
-    in
-    get_root base [new_chunk]
-
-module Dot =
+module Make
+    (Action : Action_S)
+    (State : State_S) : S with type action = Action.t and type state = State.t
+=
 struct
-  module G = Graph.Pack.Digraph
+  type action = Action.t
+  type state = State.t
 
-  let vertex_labels = Hashtbl.create 11
+  type 'a trace = { mutable elt : 'a; mutable next : 'a trace option }
 
-  let end_ = G.V.create @@ gen ()
+  type desc =
+    | Done of { uid : int ;
+                state : state ; (* Results from the application of [action] on the previous state. *)
+                action : action }
+    | Redo of { uid : int ;
+                action : action }
 
-  let () =
-    Hashtbl.add vertex_labels end_ (`End)
+  type t = desc trace ref
 
-  module Display = struct
-    include G
-    let escape s =
-      Printf.sprintf "\"%s\"" s
+  let gen =
+    let x = ref 0 in
+    fun () ->
+      let v = !x in
+      incr x;
+      v
 
-    let vertex_name v = G.V.label v |> string_of_int
+  let rec get_acc_and_reverse prev_node node_opt acc k =
+    match node_opt with
+    | None ->
+      k () ;
+      acc
+    | Some node ->
+      match node.elt with
+      | Redo _ ->
+        (* Impossible because a [Done] node may only point to [None] or [Done] node. *)
+        assert false
+      | Done { uid = _ ; state ; action } ->
+        let acc = (state, action) :: acc in
+        get_acc_and_reverse node node.next acc (fun () ->
+            k () ;
+            node.elt <- Redo { uid = gen () ; action } ;
+            node.next <- (Some prev_node)
+          )
 
-    let graph_attributes _ = []
-    let default_vertex_attributes _ = []
-    let vertex_attributes v =
-      match Hashtbl.find_opt vertex_labels v with
-      | None -> []
-      | Some `End ->
-        [`Label "EOS"]
-      | Some (`Done chunk) ->
-        [`Label chunk; `Shape `Box]
-      | Some (`Redo chunk) ->
-        [`Label chunk; `Shape `Diamond]
+  let create () =
+    ref { elt =
+            (Done { uid = gen () ; state = State.init ; action = Action.nil }) ;
+          next = None }
 
-    let default_edge_attributes _ = []
-    let edge_attributes e = [ `Label (string_of_int (E.label e) ) ]
-    let get_subgraph _ = None
-  end
-  module Dot_ = Graph.Graphviz.Dot(Display)
-  module Neato = Graph.Graphviz.Neato(Display)
-
-  let dot_output g f =
-    let oc = open_out f in
-    if G.is_directed then Dot_.output_graph oc g else Neato.output_graph oc g;
-    close_out oc
-
-  let display_with_gv g =
-    let tmp = Filename.temp_file "graph" ".dot" in
-    dot_output g tmp;
-    ignore (Sys.command ("dot -Tpng " ^ tmp ^ " | display"));
-    Sys.remove tmp
-
-  let add_vertex g v =
-    if G.mem_vertex g v then () else G.add_vertex g v
-
-  let add_edge g v1 v2 =
-    if G.mem_edge g v1 v2 then () else G.add_edge g v1 v2
-
-  let to_dot handles filename =
-    let g = G.create () in
-    add_vertex g end_ ;
-
-    let visited = Hashtbl.create 11 in
-
-    let rec unfold desc_ref =
-      match !desc_ref with
-      | End -> end_
-      | Done { uid; next ; chunk; _ } -> (
-          match Hashtbl.find_opt visited uid with
-          | Some label -> label
-          | None ->
-            (let label = G.V.create uid in
-             Hashtbl.add visited uid label ;
-             add_vertex g label ;
-             let next = unfold next in
-             add_edge g label next ;
-             Hashtbl.add vertex_labels label (`Done chunk) ;
-             label))
-      | Redo { uid ; next ; chunk; _ } -> (
-          match Hashtbl.find_opt visited uid with
-          | Some label -> label
-          | None ->
-            (let label = G.V.create uid in
-             Hashtbl.add visited uid label ;
-             add_vertex g label ;
-             let next = unfold next in
-             add_edge g label next ;
-             Hashtbl.add vertex_labels label (`Redo chunk) ;
-             label))
+  let process_action process_action new_action (base : t) : t =
+    let rec loop new_action (base : t) : desc trace =
+      let trace = !base in
+      match trace.elt with
+      | Done { uid = _; state ; action = _ } ->
+        (* Invariant: at this point, the chain of nodes reachable from [next] only contains
+           [Done] nodes. *)
+        let acc = get_acc_and_reverse trace trace.next [] (fun () -> ()) in
+        (* Invariant: at this point, [next] is rewritten to point to a [Redo] node. *)
+        let state = process_action acc state new_action in
+        let hist_elt =
+          Done { uid = gen ();
+                 state ;
+                 action = new_action }
+        in
+        let next = { elt = hist_elt; next = None } in
+        trace.next <- Some next ;
+        next
+      | Redo _ ->
+        (*
+         ... -> root <- redo(chunk0) <- redo(chunk1) <- redo(chunk2) <- ... <- base=redo(chunkN)
+                 |
+                 \-> Done(chunk0) -> Done(chunk1) -> Done(chunk2' <> chunk2) -> ... -> End
+                                     ^^^^^^^^^^^
+                                     node on which we recursively call [process_action]
+         *)
+        let rec get_root node acc =
+          match node.elt with
+          | Done _ ->
+            max_prefix node node.next acc
+          | Redo { uid = _; action } ->
+            (match node.next with
+             | None ->
+               (* Invariant: a [Redo] node {b must} point to a [Done] node. *)
+               assert false
+             | Some next ->
+               get_root next (action :: acc)
+            )
+        and max_prefix prev_node node_opt acc =
+          match node_opt, acc with
+          | _, [] ->
+            (* Impossible: [get_root] is called from a [Redo] node. *)
+            assert false
+          | None, _ ->
+            (* TODO (to test!):
+               - we have to update [base] both in this case and in the [Done] case below, no?
+            *)
+            replay prev_node acc
+          | Some node, action' :: acc' ->
+            (match node.elt with
+             | Redo _ ->
+               (* Impossible because [Done] nodes cannot point to [Redo] nodes. *)
+               assert false
+             | Done { uid = _; state = _; action } ->
+               if Action.equal action action' then
+                 max_prefix node node.next acc'
+               else
+                 replay prev_node acc
+            )
+        and replay node acc =
+          let replayed =
+            List.fold_left (fun node chunk_to_redo ->
+                loop chunk_to_redo (ref node)
+              ) node acc
+          in
+          base := replayed ;
+          loop new_action (ref replayed)
+        in
+        get_root trace []
     in
-    List.iter (fun desc_ref -> ignore @@ unfold desc_ref) handles ;
-    dot_output g filename ;
-    display_with_gv g
+    let result = loop new_action base in
+    ref result
+
+  module Dot =
+  struct
+    module G = Graph.Pack.Digraph
+
+    let vertex_labels = Hashtbl.create 11
+
+    let end_ = G.V.create @@ gen ()
+
+    let () =
+      Hashtbl.add vertex_labels end_ (`End)
+
+    module Display = struct
+      include G
+
+      let vertex_name v = G.V.label v |> string_of_int
+
+      let graph_attributes _ = []
+      let default_vertex_attributes _ = []
+      let vertex_attributes v =
+        match Hashtbl.find_opt vertex_labels v with
+        | None -> []
+        | Some `End ->
+          [`Label "EOS"]
+        | Some (`Done action) ->
+          let s = Format.asprintf "%a" Action.pp action in
+          [`Label s; `Shape `Box]
+        | Some (`Redo action) ->
+          let s = Format.asprintf "%a" Action.pp action in
+          [`Label s; `Shape `Diamond]
+
+      let default_edge_attributes _ = []
+      let edge_attributes e = [ `Label (string_of_int (E.label e) ) ]
+      let get_subgraph _ = None
+    end
+    module Dot_ = Graph.Graphviz.Dot(Display)
+    module Neato = Graph.Graphviz.Neato(Display)
+
+    let dot_output g f =
+      let oc = open_out f in
+      if G.is_directed then Dot_.output_graph oc g else Neato.output_graph oc g;
+      close_out oc
+
+    let display_with_png g file =
+      let tmp = Filename.temp_file "graph" ".dot" in
+      dot_output g tmp;
+      ignore (Sys.command ("dot -Tpng " ^ tmp ^ " > " ^ file));
+      Sys.remove tmp
+
+    let add_vertex g v =
+      if G.mem_vertex g v then () else G.add_vertex g v
+
+    let add_edge g v1 v2 =
+      if G.mem_edge g v1 v2 then () else G.add_edge g v1 v2
+
+    let to_dot (handles : t list) filename =
+      let g = G.create () in
+      add_vertex g end_ ;
+
+      let visited = Hashtbl.create 11 in
+
+      let rec unfold node_opt =
+        match node_opt with
+        | None -> end_
+        | Some node ->
+          (match node.elt with
+           | Done { uid; action; _ } -> (
+               match Hashtbl.find_opt visited uid with
+               | Some label -> label
+               | None ->
+                 (let label = G.V.create uid in
+                  Hashtbl.add visited uid label ;
+                  add_vertex g label ;
+                  let next = unfold node.next in
+                  add_edge g label next ;
+                  Hashtbl.add vertex_labels label (`Done action) ;
+                  label))
+           | Redo { uid ; action; _ } -> (
+               match Hashtbl.find_opt visited uid with
+               | Some label -> label
+               | None ->
+                 (let label = G.V.create uid in
+                  Hashtbl.add visited uid label ;
+                  add_vertex g label ;
+                  let next = unfold node.next in
+                  add_edge g label next ;
+                  Hashtbl.add vertex_labels label (`Redo action) ;
+                  label)))
+      in
+      List.iter (fun node_ref -> ignore @@ unfold (Some !node_ref)) handles ;
+      dot_output g filename ;
+      display_with_png g (filename ^ ".png")
+  end
+
 end

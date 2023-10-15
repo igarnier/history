@@ -1,4 +1,4 @@
-(test
- (name basic)
+(tests
+ (names basic semipersistent)
  (libraries history)
 )

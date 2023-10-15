@@ -1,10 +1,20 @@
 [@@@ocaml.warning "-32"]
 
-let display_graphs = false
+module H = History.Make (struct 
+    type t = string
+    let nil = ""
+    let equal = String.equal
+    let pp = Format.pp_print_string
+  end) (struct
+    type t = unit
+    let init = ()
+  end)
+
+let display_graphs = true
 
 let to_dot =
   if display_graphs then
-    History.Dot.to_dot
+    H.Dot.to_dot
   else
     fun _ _ -> ()
 
@@ -12,7 +22,7 @@ let () = Format.printf "@."
 
 let test process =
 
-  let initial = History.create () in
+  let initial = H.create () in
 
   let chain1 =
     initial
@@ -62,23 +72,19 @@ let test process =
     |> process " But he wasn't that hungry."
   in
 
-  let () = to_dot [initial; chain1; chain2; chain3; chain4; chain5; chain6; chain7 ] "chain7.dot" in
+  let () = to_dot [initial; chain1; chain2; chain3; chain4; chain5; chain6; chain7] "chain7.dot" in
+
+  let chain8 =
+    chain6
+    |> process ", how about a carrot?"
+  in
+
+  let () = to_dot [initial; chain1; chain2; chain3; chain4; chain5; chain6; chain7; chain8] "chain8.dot" in
 
   ()
 
+let infinite_context _acc _prev_state action =
+  Format.printf "Unbounded  \"%s\"@." action ;
+  ()
 
-let infinite_context _ctxt _n_common s =
-  Format.printf "Unbounded  \"%s\"@." s ;
-  10
-
-let () = test (History.process_chunk infinite_context ())
-
-let context_swapping _ctxt n_common s =
-  Format.printf "Bounded(10) \"%s\"@." s ;
-  let len = String.length s in
-  if n_common + len >= 10 then
-    Int.min n_common 5
-  else
-    n_common + len
-
-let () = test (History.process_chunk context_swapping ())
+let () = test (H.process_action infinite_context)
