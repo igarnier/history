@@ -1,15 +1,18 @@
 module type Action_S =
 sig
   type t
+  type state
   val nil : t
   val equal : t -> t -> bool
+  val apply : state -> t -> state
+  val undo : state -> t -> state
   val pp : Format.formatter -> t -> unit
 end
 
 module type State_S =
 sig
   type t
-  val init : t
+  val init : unit -> t
 end
 
 module type S =
@@ -18,8 +21,9 @@ sig
   type state
   type t
   val create : unit -> t
-  val process_action :
-    ((state * action) list -> state -> action -> state) -> action -> t -> t
+  val reroot : t -> unit
+  val process_action : action -> t -> t
+  val state : t -> state
 
   module Dot :
     sig
@@ -28,18 +32,22 @@ sig
 end
 
 module Make
-    (Action : Action_S)
-    (State : State_S) : S with type action = Action.t and type state = State.t
+    (State : State_S)
+    (Action : Action_S with type state = State.t)
+  : S with type action = Action.t and type state = State.t
 =
 struct
   type action = Action.t
   type state = State.t
 
-  type 'a trace = { mutable elt : 'a; mutable next : 'a trace option }
+  type 'a trace = { mutable elt : 'a; mutable next : 'a node }
+
+  and 'a node =
+    | Top of state
+    | Node of 'a trace
 
   type desc =
     | Done of { uid : int ;
-                state : state ; (* Results from the application of [action] on the previous state. *)
                 action : action }
     | Redo of { uid : int ;
                 action : action }
@@ -53,101 +61,182 @@ struct
       incr x;
       v
 
-  let rec get_acc_and_reverse prev_node node_opt acc k =
+  let rec get_acc_and_reverse prev_node node_opt k =
     match node_opt with
-    | None ->
-      k () ;
-      acc
-    | Some node ->
+    | Top state ->
+      k state
+    | Node node ->
       match node.elt with
       | Redo _ ->
         (* Impossible because a [Done] node may only point to [None] or [Done] node. *)
         assert false
-      | Done { uid = _ ; state ; action } ->
-        let acc = (state, action) :: acc in
-        get_acc_and_reverse node node.next acc (fun () ->
-            k () ;
+      | Done { uid = _ ; action } ->
+        get_acc_and_reverse node node.next (fun state ->
+            let state = Action.undo state action in
+            let result = k state in
             node.elt <- Redo { uid = gen () ; action } ;
-            node.next <- (Some prev_node)
+            node.next <- (Node prev_node) ;
+            result
           )
 
   let create () =
-    ref { elt =
-            (Done { uid = gen () ; state = State.init ; action = Action.nil }) ;
-          next = None }
+    ref { elt = Done { uid = gen () ; action = Action.nil } ;
+          next = Top (State.init ()) }
 
-  let process_action process_action new_action (base : t) : t =
-    let rec loop new_action (base : t) : desc trace =
-      let trace = !base in
-      match trace.elt with
-      | Done { uid = _; state ; action = _ } ->
-        (* Invariant: at this point, the chain of nodes reachable from [next] only contains
-           [Done] nodes. *)
-        let acc = get_acc_and_reverse trace trace.next [] (fun () -> ()) in
-        (* Invariant: at this point, [next] is rewritten to point to a [Redo] node. *)
-        let state = process_action acc state new_action in
-        let hist_elt =
-          Done { uid = gen ();
-                 state ;
-                 action = new_action }
-        in
-        let next = { elt = hist_elt; next = None } in
-        trace.next <- Some next ;
-        next
-      | Redo _ ->
+  let rec reroot (base : t) : unit =
+    let trace = !base in
+    match trace.elt with
+    | Done _ ->
+      (* Invariant: at this point, the chain of nodes reachable from [next] only contains
+         [Done] nodes. *)
+      let state = get_acc_and_reverse trace trace.next Fun.id in
+      trace.next <- Top state
+    | Redo _ ->
         (*
-         ... -> root <- redo(chunk0) <- redo(chunk1) <- redo(chunk2) <- ... <- base=redo(chunkN)
+         ... -> root <- redo( action0) <- redo( action1) <- redo( action2) <- ... <- base=redo( actionN)
                  |
-                 \-> Done(chunk0) -> Done(chunk1) -> Done(chunk2' <> chunk2) -> ... -> End
+                 \-> Done( action0) -> Done( action1) -> Done( action2' <>  action2) -> ... -> Top
                                      ^^^^^^^^^^^
                                      node on which we recursively call [process_action]
          *)
-        let rec get_root node acc =
-          match node.elt with
-          | Done _ ->
-            max_prefix node node.next acc
-          | Redo { uid = _; action } ->
-            (match node.next with
-             | None ->
-               (* Invariant: a [Redo] node {b must} point to a [Done] node. *)
-               assert false
-             | Some next ->
-               get_root next (action :: acc)
-            )
-        and max_prefix prev_node node_opt acc =
-          match node_opt, acc with
-          | _, [] ->
-            (* Impossible: [get_root] is called from a [Redo] node. *)
-            assert false
-          | None, _ ->
-            (* TODO (to test!):
-               - we have to update [base] both in this case and in the [Done] case below, no?
-            *)
-            replay prev_node acc
-          | Some node, action' :: acc' ->
-            (match node.elt with
-             | Redo _ ->
-               (* Impossible because [Done] nodes cannot point to [Redo] nodes. *)
-               assert false
-             | Done { uid = _; state = _; action } ->
-               if Action.equal action action' then
-                 max_prefix node node.next acc'
-               else
-                 replay prev_node acc
-            )
-        and replay node acc =
-          let replayed =
-            List.fold_left (fun node chunk_to_redo ->
-                loop chunk_to_redo (ref node)
-              ) node acc
-          in
-          base := replayed ;
-          loop new_action (ref replayed)
+      let rec get_root node acc =
+        match node.elt with
+        | Done _ ->
+          max_prefix node node.next acc
+        | Redo { uid = _; action } ->
+          (match node.next with
+           | Top _ ->
+             (* Invariant: a [Redo] node {b must} point to a [Done] node. *)
+             assert false
+           | Node next ->
+             get_root next (action :: acc)
+          )
+      and max_prefix prev_node node_opt acc =
+        match node_opt, acc with
+        | _, [] ->
+          (* Impossible: [get_root] is called from a [Redo] node. *)
+          assert false
+        | Top _state, _ ->
+          (* TODO (to test!):
+             - we have to update [base] both in this case and in the [Done] case below, no?
+          *)
+          replay prev_node acc
+        | Node node, action' :: acc' ->
+          (match node.elt with
+           | Redo _ ->
+             (* Impossible because [Done] nodes cannot point to [Redo] nodes. *)
+             assert false
+           | Done { uid = _; action } ->
+             if Action.equal action action' then
+               max_prefix node node.next acc'
+             else
+               replay prev_node acc
+          )
+      and replay node acc =
+        let replayed =
+          List.fold_left (fun node action_to_redo ->
+              process_action action_to_redo node
+            ) (ref node) acc
         in
-        get_root trace []
-    in
-    let result = loop new_action base in
-    ref result
+        base := !replayed
+      in
+      get_root trace []
+
+  and process_action new_action (base : t) : t =
+    reroot base ;
+    let node = !base in
+    match node.next with
+    | Top state ->
+      let state' = Action.apply state new_action in
+      let trace = { elt =
+                      Done { uid = gen () ;
+                             action = new_action } ;
+                    next = Top state' } in
+      node.next <- Node trace ;
+      ref trace
+    | _ ->
+      assert false
+ 
+  let state base =
+    reroot base ;
+    let node = !base in
+    match node.next with
+    | Top state -> state
+    | _ ->
+      assert false
+ 
+  (* let process_action process_action new_action (base : t) : t = *)
+  (*   let rec loop new_action (base : t) : desc trace = *)
+  (*     let trace = !base in *)
+  (*     match trace.elt with *)
+  (*     | Done { uid = _; state ; action = _ } -> *)
+  (*       (\* Invariant: at this point, the chain of nodes reachable from [next] only contains *)
+  (*          [Done] nodes. *\) *)
+  (*       let acc = get_acc_and_reverse trace trace.next [] (fun () -> ()) in *)
+  (*       (\* Invariant: at this point, [next] is rewritten to point to a [Redo] node. *\) *)
+  (*       let state = process_action acc state new_action in *)
+  (*       let hist_elt = *)
+  (*         Done { uid = gen (); *)
+  (*                state ; *)
+  (*                action = new_action } *)
+  (*       in *)
+  (*       let next = { elt = hist_elt; next = None } in *)
+  (*       trace.next <- Some next ; *)
+  (*       next *)
+  (*     | Redo _ -> *)
+  (*       (\* *)
+  (*        ... -> root <- redo( action0) <- redo( action1) <- redo( action2) <- ... <- base=redo( actionN) *)
+  (*                | *)
+  (*                \-> Done( action0) -> Done( action1) -> Done( action2' <>  action2) -> ... -> End *)
+  (*                                    ^^^^^^^^^^^ *)
+  (*                                    node on which we recursively call [process_action] *)
+  (*        *\) *)
+  (*       let rec get_root node acc = *)
+  (*         match node.elt with *)
+  (*         | Done _ -> *)
+  (*           max_prefix node node.next acc *)
+  (*         | Redo { uid = _; action } -> *)
+  (*           (match node.next with *)
+  (*            | None -> *)
+  (*              (\* Invariant: a [Redo] node {b must} point to a [Done] node. *\) *)
+  (*              assert false *)
+  (*            | Some next -> *)
+  (*              get_root next (action :: acc) *)
+  (*           ) *)
+  (*       and max_prefix prev_node node_opt acc = *)
+  (*         match node_opt, acc with *)
+  (*         | _, [] -> *)
+  (*           (\* Impossible: [get_root] is called from a [Redo] node. *\) *)
+  (*           assert false *)
+  (*         | None, _ -> *)
+  (*           (\* TODO (to test!): *)
+  (*              - we have to update [base] both in this case and in the [Done] case below, no? *)
+  (*           *\) *)
+  (*           replay prev_node acc *)
+  (*         | Some node, action' :: acc' -> *)
+  (*           (match node.elt with *)
+  (*            | Redo _ -> *)
+  (*              (\* Impossible because [Done] nodes cannot point to [Redo] nodes. *\) *)
+  (*              assert false *)
+  (*            | Done { uid = _; state = _; action } -> *)
+  (*              if Action.equal action action' then *)
+  (*                max_prefix node node.next acc' *)
+  (*              else *)
+  (*                replay prev_node acc *)
+  (*           ) *)
+  (*       and replay node acc = *)
+  (*         let replayed = *)
+  (*           List.fold_left (fun node  action_to_redo -> *)
+  (*               loop  action_to_redo (ref node) *)
+  (*             ) node acc *)
+  (*         in *)
+  (*         base := replayed ; *)
+  (*         loop new_action (ref replayed) *)
+  (*       in *)
+  (*       get_root trace [] *)
+  (*   in *)
+  (*   let result = loop new_action base in *)
+  (*   ref result *)
 
   module Dot =
   struct
@@ -211,8 +300,8 @@ struct
 
       let rec unfold node_opt =
         match node_opt with
-        | None -> end_
-        | Some node ->
+        | Top _ -> end_
+        | Node node ->
           (match node.elt with
            | Done { uid; action; _ } -> (
                match Hashtbl.find_opt visited uid with
@@ -237,7 +326,7 @@ struct
                   Hashtbl.add vertex_labels label (`Redo action) ;
                   label)))
       in
-      List.iter (fun node_ref -> ignore @@ unfold (Some !node_ref)) handles ;
+      List.iter (fun node_ref -> ignore @@ unfold (Node !node_ref)) handles ;
       dot_output g filename ;
       display_with_png g (filename ^ ".png")
   end

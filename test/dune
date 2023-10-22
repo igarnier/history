@@ -1,4 +1,4 @@
 (tests
  (names basic semipersistent)
- (libraries history)
+ (libraries history crowbar)
 )

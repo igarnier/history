@@ -1,13 +1,16 @@
 [@@@ocaml.warning "-32"]
 
-module H = History.Make (struct 
+module H = History.Make (struct
+    type t = unit
+    let init () = ()
+  end) (struct 
     type t = string
+    type state = unit
     let nil = ""
+    let apply () _ = ()
+    let undo () _ = ()
     let equal = String.equal
     let pp = Format.pp_print_string
-  end) (struct
-    type t = unit
-    let init = ()
   end)
 
 let display_graphs = true
@@ -87,4 +90,4 @@ let infinite_context _acc _prev_state action =
   Format.printf "Unbounded  \"%s\"@." action ;
   ()
 
-let () = test (H.process_action infinite_context)
+let () = test H.process_action
