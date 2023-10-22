@@ -2,30 +2,23 @@ module Action =
 struct
   type t =
     | Set of { index : int ; value : int; prev_value : int }
-    | Nil
 
   type state = int array
-
-  let nil = Nil
 
   let equal a1 a2 = a1 = a2
 
   let apply array (a : t) =
     match a with
     | Set { index ; value; prev_value = _ } -> array.(index) <- value ; array
-    | Nil -> array
 
   let undo array (a : t) =
     match a with
     | Set { index ; value = _; prev_value } -> array.(index) <- prev_value ; array
-    | Nil -> array
 
   let pp fmtr action =
     match action with
     | Set { index; value; prev_value } ->
       Format.fprintf fmtr "a[%d] = %d -> %d;" index prev_value value
-    | Nil ->
-      Format.fprintf fmtr "Nil"
 end
 
 let array_length = 10
@@ -65,13 +58,20 @@ end
 type action =
   | Set of { index : int ; value : int }
   | Get of { index : int }
+  | Save
+  | Undo
 
 let index_gen = Crowbar.range array_length
 let value_gen = Crowbar.int
 
 let action_gen =
-  Crowbar.(map [bool; index_gen; value_gen]) @@ fun is_set index value ->
-  if is_set then Set { index; value } else Get { index }
+  Crowbar.(map [range 4; index_gen; value_gen]) @@ fun kind index value ->
+  match kind with
+  | 0 -> Set { index; value }
+  | 1 -> Get { index }
+  | 2 -> Save
+  | 3 -> Undo
+  | _ -> assert false
 
 let scenario_gen = Crowbar.list action_gen
 
@@ -82,28 +82,37 @@ let equal oracle handle =
       array.(i) = Persistent.get oracle i
   )
 
-let rec execute_scenario oracle handle acc scenario =
+let rec execute_scenario oracle handle saves acc scenario =
   match scenario with
   | [] -> ()
   | (Set { index; value } as action) :: rest ->
     let oracle = Persistent.set oracle index value in
     let handle = set handle index value in
     if equal oracle handle then
-      execute_scenario oracle handle (action :: acc) rest
+      execute_scenario oracle handle saves (action :: acc) rest
     else
       assert false
   | (Get { index } as action) :: rest ->
     let v_oracle = Persistent.get oracle index in
     let v_handle = get handle index in
     if equal oracle handle && v_oracle = v_handle then
-      execute_scenario oracle handle (action :: acc) rest
+      execute_scenario oracle handle saves (action :: acc) rest
     else
       assert false
+  | Save :: rest ->
+    execute_scenario oracle handle ((oracle, handle) :: saves) (Save :: acc) rest
+  | Undo :: rest ->
+    (match saves with
+     | [] ->
+       execute_scenario oracle handle saves acc rest
+     | (oracle, handle) :: saves ->
+       execute_scenario oracle handle saves acc rest
+    )
 
 let () =
   Crowbar.(add_test ~name:"Semi-persistent array" [scenario_gen]) @@ fun scenario ->
   let oracle = Persistent.empty in
   let handle = H.create () in
-  execute_scenario oracle handle [] scenario
+  execute_scenario oracle handle [] [] scenario
   
 

@@ -6,7 +6,6 @@ module H = History.Make (struct
   end) (struct 
     type t = string
     type state = unit
-    let nil = ""
     let apply () _ = ()
     let undo () _ = ()
     let equal = String.equal

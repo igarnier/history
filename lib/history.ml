@@ -2,7 +2,6 @@ module type Action_S =
 sig
   type t
   type state
-  val nil : t
   val equal : t -> t -> bool
   val apply : state -> t -> state
   val undo : state -> t -> state
@@ -47,6 +46,7 @@ struct
     | Node of 'a trace
 
   type desc =
+    | Empty
     | Done of { uid : int ;
                 action : action }
     | Redo of { uid : int ;
@@ -67,8 +67,8 @@ struct
       k state
     | Node node ->
       match node.elt with
-      | Redo _ ->
-        (* Impossible because a [Done] node may only point to [None] or [Done] node. *)
+      | Empty | Redo _ ->
+        (* Impossible because a [Done] node may only point to [Top] or [Done] node. *)
         assert false
       | Done { uid = _ ; action } ->
         get_acc_and_reverse node node.next (fun state ->
@@ -80,13 +80,13 @@ struct
           )
 
   let create () =
-    ref { elt = Done { uid = gen () ; action = Action.nil } ;
+    ref { elt = Empty ;
           next = Top (State.init ()) }
 
   let rec reroot (base : t) : unit =
     let trace = !base in
     match trace.elt with
-    | Done _ ->
+    | Empty | Done _ ->
       (* Invariant: at this point, the chain of nodes reachable from [next] only contains
          [Done] nodes. *)
       let state = get_acc_and_reverse trace trace.next Fun.id in
@@ -101,12 +101,13 @@ struct
          *)
       let rec get_root node acc =
         match node.elt with
+        | Empty
         | Done _ ->
           max_prefix node node.next acc
         | Redo { uid = _; action } ->
           (match node.next with
            | Top _ ->
-             (* Invariant: a [Redo] node {b must} point to a [Done] node. *)
+             (* Invariant: a [Redo] node {b must} point to a [Done] or an [Empty] node. *)
              assert false
            | Node next ->
              get_root next (action :: acc)
@@ -123,7 +124,7 @@ struct
           replay prev_node acc
         | Node node, action' :: acc' ->
           (match node.elt with
-           | Redo _ ->
+           | Empty | Redo _ ->
              (* Impossible because [Done] nodes cannot point to [Redo] nodes. *)
              assert false
            | Done { uid = _; action } ->
@@ -165,79 +166,6 @@ struct
     | _ ->
       assert false
  
-  (* let process_action process_action new_action (base : t) : t = *)
-  (*   let rec loop new_action (base : t) : desc trace = *)
-  (*     let trace = !base in *)
-  (*     match trace.elt with *)
-  (*     | Done { uid = _; state ; action = _ } -> *)
-  (*       (\* Invariant: at this point, the chain of nodes reachable from [next] only contains *)
-  (*          [Done] nodes. *\) *)
-  (*       let acc = get_acc_and_reverse trace trace.next [] (fun () -> ()) in *)
-  (*       (\* Invariant: at this point, [next] is rewritten to point to a [Redo] node. *\) *)
-  (*       let state = process_action acc state new_action in *)
-  (*       let hist_elt = *)
-  (*         Done { uid = gen (); *)
-  (*                state ; *)
-  (*                action = new_action } *)
-  (*       in *)
-  (*       let next = { elt = hist_elt; next = None } in *)
-  (*       trace.next <- Some next ; *)
-  (*       next *)
-  (*     | Redo _ -> *)
-  (*       (\* *)
-  (*        ... -> root <- redo( action0) <- redo( action1) <- redo( action2) <- ... <- base=redo( actionN) *)
-  (*                | *)
-  (*                \-> Done( action0) -> Done( action1) -> Done( action2' <>  action2) -> ... -> End *)
-  (*                                    ^^^^^^^^^^^ *)
-  (*                                    node on which we recursively call [process_action] *)
-  (*        *\) *)
-  (*       let rec get_root node acc = *)
-  (*         match node.elt with *)
-  (*         | Done _ -> *)
-  (*           max_prefix node node.next acc *)
-  (*         | Redo { uid = _; action } -> *)
-  (*           (match node.next with *)
-  (*            | None -> *)
-  (*              (\* Invariant: a [Redo] node {b must} point to a [Done] node. *\) *)
-  (*              assert false *)
-  (*            | Some next -> *)
-  (*              get_root next (action :: acc) *)
-  (*           ) *)
-  (*       and max_prefix prev_node node_opt acc = *)
-  (*         match node_opt, acc with *)
-  (*         | _, [] -> *)
-  (*           (\* Impossible: [get_root] is called from a [Redo] node. *\) *)
-  (*           assert false *)
-  (*         | None, _ -> *)
-  (*           (\* TODO (to test!): *)
-  (*              - we have to update [base] both in this case and in the [Done] case below, no? *)
-  (*           *\) *)
-  (*           replay prev_node acc *)
-  (*         | Some node, action' :: acc' -> *)
-  (*           (match node.elt with *)
-  (*            | Redo _ -> *)
-  (*              (\* Impossible because [Done] nodes cannot point to [Redo] nodes. *\) *)
-  (*              assert false *)
-  (*            | Done { uid = _; state = _; action } -> *)
-  (*              if Action.equal action action' then *)
-  (*                max_prefix node node.next acc' *)
-  (*              else *)
-  (*                replay prev_node acc *)
-  (*           ) *)
-  (*       and replay node acc = *)
-  (*         let replayed = *)
-  (*           List.fold_left (fun node  action_to_redo -> *)
-  (*               loop  action_to_redo (ref node) *)
-  (*             ) node acc *)
-  (*         in *)
-  (*         base := replayed ; *)
-  (*         loop new_action (ref replayed) *)
-  (*       in *)
-  (*       get_root trace [] *)
-  (*   in *)
-  (*   let result = loop new_action base in *)
-  (*   ref result *)
-
   module Dot =
   struct
     module G = Graph.Pack.Digraph
@@ -246,8 +174,11 @@ struct
 
     let end_ = G.V.create @@ gen ()
 
+    let start = G.V.create @@ gen ()
+
     let () =
-      Hashtbl.add vertex_labels end_ (`End)
+      Hashtbl.add vertex_labels start `Start ;
+      Hashtbl.add vertex_labels end_ `End
 
     module Display = struct
       include G
@@ -259,6 +190,8 @@ struct
       let vertex_attributes v =
         match Hashtbl.find_opt vertex_labels v with
         | None -> []
+        | Some `Start ->
+          [`Label "START"]
         | Some `End ->
           [`Label "EOS"]
         | Some (`Done action) ->
@@ -303,6 +236,10 @@ struct
         | Top _ -> end_
         | Node node ->
           (match node.elt with
+           | Empty ->
+             let next = unfold node.next in
+             add_edge g start next ;
+             start
            | Done { uid; action; _ } -> (
                match Hashtbl.find_opt visited uid with
                | Some label -> label
