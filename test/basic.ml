@@ -16,7 +16,7 @@ let display_graphs = true
 
 let to_dot =
   if display_graphs then
-    H.Dot.to_dot
+    H.Internal_for_tests.to_dot
   else
     fun _ _ -> ()
 

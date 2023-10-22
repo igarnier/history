@@ -1,16 +1,36 @@
+(** The module type of actions. *)
 module type Action_S =
 sig
+
+  (** The type of actions. *)
   type t
+
+  (** The type of states on which actions are performed. *)
   type state
+
+  (** [equal] tests whether two actions are equal. *)
   val equal : t -> t -> bool
+
+  (** [apply state a] applies [a] on [state]. *)
   val apply : state -> t -> state
+
+  (** [undo state a] reverts the effect of [a] on [state]. 
+      We expect that [undo (apply state a) a] is equal to [state]: however,
+      it is not a requirement of this library. *)
   val undo : state -> t -> state
+
+  (** [pp fmtr a] prints the action [a]. *)
   val pp : Format.formatter -> t -> unit
 end
 
+(** The module type of states. *)
 module type State_S =
 sig
+
+  (** The type of states. *)
   type t
+
+  (** [init ()] is an empty state. *)
   val init : unit -> t
 end
 
@@ -18,16 +38,27 @@ module type S =
 sig
   type action
   type state
+
+  (** The type of handles to states. *)
   type t
+
+  (** Create a handle. The associate state is obtained by [State_S.init]. *)
   val create : unit -> t
+
+  (** [reroot handle] let [handle] become the current holder of the state. 
+      Calling [reroot] may trigger undoing and redoing of some actions. *)
   val reroot : t -> unit
+
+  (** [process_action a handle] applies [a] on the state corresponding to [handle]. *)
   val process_action : action -> t -> t
+
+  (** [state handle] returns the state corresponding to [handle]. *)
   val state : t -> state
 
-  module Dot :
-    sig
-      val to_dot : t list -> string -> unit
-    end
+  module Internal_for_tests :
+  sig
+    val to_dot : t list -> string -> unit
+  end
 end
 
 module Make
@@ -166,7 +197,7 @@ struct
     | _ ->
       assert false
  
-  module Dot =
+  module Internal_for_tests =
   struct
     module G = Graph.Pack.Digraph
 
